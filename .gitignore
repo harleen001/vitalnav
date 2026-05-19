@@ -1,0 +1,21 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Streamlit local configuration and credentials
+.streamlit/config.toml
+.streamlit/secrets.toml
+
+# Databases (Do not track your local user DB)
+*.db
+vitalnav_users.db
+
+# Virtual Environments (just in case you add one later)
+venv/
+.venv/
+env/
+
+# OS generated files
+.DS_Store
+Thumbs.db
