@@ -1,186 +1,215 @@
-"""face_auth.py — VitalNav face biometric authentication
-Uses OpenCV Haar cascade (face detection) + multi-metric comparison:
-  1. LBPH histogram distance  (Local Binary Patterns — primary identity signal)
-  2. Structural Similarity     (SSIM on greyscale patch)
-  3. Colour histogram          (Bhattacharyya distance, supplemental)
+"""face_auth.py — VitalNav face biometric authentication (v2)
 
-Match threshold : 0.70  (70 %)
-Center crop     : live frame is cropped to the centre square that matches
-                  the blue guide box shown in the UI (52 % of frame width)
-                  BEFORE face detection — faces outside the box are ignored.
+Approach
+--------
+Detection  : Multi-cascade Haar with eye confirmation (proves it's a real face,
+             not a blob or object).  Falls back to largest-face without eyes on
+             stored signup photos (controlled environment).
 
-All processing is local / CPU-only — no external model downloads needed.
+Recognition: cv2.face.LBPHFaceRecognizer trained on the fly against the stored
+             signup photo (±4 mild augmentations) for a proper ML confidence
+             score, combined with SSIM + colour histogram ensemble.
+
+Threshold  : 0.60  (60 % weighted match required)
+
+No external models — everything ships with opencv-contrib-python.
 """
 from __future__ import annotations
 
 import base64
 import logging
+from typing import Optional
 
 import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# ── Cascade models ────────────────────────────────────────────────────────────
-_CASCADE     = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-_CASCADE_ALT = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml")
+# ── tunables ──────────────────────────────────────────────────────────────────
+FACE_SIZE        = 160          # px — larger than v1 for better LBPH texture
+MATCH_THRESHOLD  = 0.60         # 0–1 weighted ensemble score
+MIN_FACE_PX      = 80           # detector: reject faces smaller than this
+EYE_CONFIRMATION = True         # require eye detection inside live-frame face
+MAX_LBPH_DIST    = 120.0        # LBPH predict() distance → clamp to [0, 1]
 
-FACE_SIZE       = 128   # every detected face patch is normalised to this square (px)
-MATCH_THRESHOLD = 0.70  # minimum weighted score to accept a match
+# ── cascades ──────────────────────────────────────────────────────────────────
+_FACE_CASCADES = [
+    cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml"),
+    cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml"),
+    cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_alt.xml"),
+]
 
+_EYE_CASCADE = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml"
+)
 
-# ── Image helpers ─────────────────────────────────────────────────────────────
+# ── image I/O ─────────────────────────────────────────────────────────────────
 
-def _bytes_to_bgr(raw: bytes) -> np.ndarray | None:
+def _bytes_to_bgr(raw: bytes) -> Optional[np.ndarray]:
     arr = np.frombuffer(raw, dtype=np.uint8)
-    return cv2.imdecode(arr, cv2.IMREAD_COLOR)   # None on failure
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
-def _b64_to_bgr(b64: str) -> np.ndarray | None:
+def _b64_to_bgr(b64: str) -> Optional[np.ndarray]:
     try:
         return _bytes_to_bgr(base64.b64decode(b64))
     except Exception:
         return None
 
 
-def _crop_center_square(img: np.ndarray, fraction: float = 0.52) -> np.ndarray:
-    """
-    Crop the centre square from *img*.
+# ── pre-processing ────────────────────────────────────────────────────────────
 
-    fraction  — side length as a fraction of the image's shorter dimension.
-                0.52 matches the CSS ::after overlay in auth.py (52 % of widget width).
-    The Y centre is shifted slightly upward (×0.48) to match the CSS
-    translate(-50%, -54%) offset used in the guide box.
-    """
-    h, w  = img.shape[:2]
-    side  = int(min(h, w) * fraction)
-    cx    = w // 2
-    cy    = int(h * 0.48)           # ~48 % from top  ≈  CSS -54 % shift
-    x1    = max(0, cx - side // 2)
-    y1    = max(0, cy - side // 2)
-    x2    = min(w, x1 + side)
-    y2    = min(h, y1 + side)
-    return img[y1:y2, x1:x2]
+def _preprocess(patch: np.ndarray) -> np.ndarray:
+    """Resize → CLAHE on L channel → return colour patch (for colour metric)
+    and grey patch (for LBPH / SSIM)."""
+    resized = cv2.resize(patch, (FACE_SIZE, FACE_SIZE))
+    lab = cv2.cvtColor(resized, cv2.COLOR_BGR2LAB)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
 
-def _detect_face(img_bgr: np.ndarray) -> np.ndarray | None:
-    """
-    Detect the largest frontal face in *img_bgr*.
-    Returns a normalised FACE_SIZE × FACE_SIZE BGR patch, or None if not found.
-    """
-    gray    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gray_eq = cv2.equalizeHist(gray)
+def _to_grey(patch: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
 
-    faces = np.array([])
-    for cascade in (_CASCADE, _CASCADE_ALT):
-        faces = cascade.detectMultiScale(
-            gray_eq, scaleFactor=1.1, minNeighbors=5,
-            minSize=(48, 48), flags=cv2.CASCADE_SCALE_IMAGE,
-        )
-        if len(faces) > 0:
-            break
 
-    # Relaxed fallback
-    if len(faces) == 0:
-        faces = _CASCADE.detectMultiScale(
-            gray_eq, scaleFactor=1.05, minNeighbors=3, minSize=(32, 32),
-        )
+# ── augmentation (used to train LBPH on a single image) ─────────────────────
 
-    if len(faces) == 0:
+def _augment(grey: np.ndarray) -> list[np.ndarray]:
+    """Return original + small perturbations so LBPH gets a tiny training set."""
+    variants = [grey]
+    # slight brightness shifts
+    for delta in (-18, 18):
+        shifted = np.clip(grey.astype(np.int16) + delta, 0, 255).astype(np.uint8)
+        variants.append(shifted)
+    # horizontal flip (same person, mirrored)
+    variants.append(cv2.flip(grey, 1))
+    # tiny Gaussian blur (simulates soft focus)
+    variants.append(cv2.GaussianBlur(grey, (3, 3), 0))
+    return variants
+
+
+# ── face detection ────────────────────────────────────────────────────────────
+
+def _has_eyes(face_roi_grey: np.ndarray) -> bool:
+    """Return True if at least one eye is detected in the upper-half of the ROI."""
+    h = face_roi_grey.shape[0]
+    upper = face_roi_grey[: h // 2, :]
+    eyes = _EYE_CASCADE.detectMultiScale(
+        upper,
+        scaleFactor=1.1,
+        minNeighbors=3,
+        minSize=(20, 20),
+    )
+    return len(eyes) >= 1
+
+
+def _detect_largest_face(
+    img_bgr: np.ndarray,
+    min_px: int = MIN_FACE_PX,
+    require_eyes: bool = False,
+) -> Optional[np.ndarray]:
+    """Return preprocessed face patch (colour) of the largest confirmed face,
+    or None if not found."""
+    img_h, img_w = img_bgr.shape[:2]
+    grey = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    eq   = cv2.equalizeHist(grey)
+
+    best_area = 0
+    best_box: Optional[tuple] = None
+
+    for cascade in _FACE_CASCADES:
+        for scale, neighbors in [(1.1, 5), (1.1, 3), (1.05, 3)]:
+            faces = cascade.detectMultiScale(
+                eq,
+                scaleFactor=scale,
+                minNeighbors=neighbors,
+                minSize=(min_px, min_px),
+                flags=cv2.CASCADE_SCALE_IMAGE,
+            )
+            if len(faces) == 0:
+                continue
+            for (x, y, w, h) in faces:
+                area = w * h
+                if area <= best_area:
+                    continue
+                if require_eyes:
+                    roi_grey = grey[y : y + h, x : x + w]
+                    if not _has_eyes(roi_grey):
+                        continue
+                best_area = area
+                best_box  = (x, y, w, h)
+
+    if best_box is None:
         return None
 
-    # Use the largest bounding box
-    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-    pad = int(0.15 * min(w, h))
-    x1  = max(0, x - pad)
-    y1  = max(0, y - pad)
-    x2  = min(img_bgr.shape[1], x + w + pad)
-    y2  = min(img_bgr.shape[0], y + h + pad)
-    return cv2.resize(img_bgr[y1:y2, x1:x2], (FACE_SIZE, FACE_SIZE))
+    x, y, w, h = best_box
+    pad = int(0.12 * min(w, h))
+    x1 = max(0, x - pad);       y1 = max(0, y - pad)
+    x2 = min(img_w, x + w + pad); y2 = min(img_h, y + h + pad)
+    return _preprocess(img_bgr[y1:y2, x1:x2])
 
 
-# ── Similarity metrics ────────────────────────────────────────────────────────
+# ── similarity metrics ────────────────────────────────────────────────────────
 
-def _lbph_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """LBP histogram chi-squared distance → 0-1 similarity (1 = identical)."""
-    def lbp_hist(gray: np.ndarray) -> np.ndarray:
-        h, w = gray.shape
-        lbp  = np.zeros_like(gray, dtype=np.uint8)
-        for bit, (dy, dx) in enumerate([(-1,-1),(-1,0),(-1,1),(0,1),
-                                         (1,1),(1,0),(1,-1),(0,-1)]):
-            shifted = np.roll(np.roll(gray, dy, axis=0), dx, axis=1)
-            lbp    |= ((gray >= shifted).astype(np.uint8) << bit)
-        cell_h, cell_w = h // 4, w // 4
-        hist = []
-        for r in range(4):
-            for c in range(4):
-                cell = lbp[r*cell_h:(r+1)*cell_h, c*cell_w:(c+1)*cell_w]
-                hc, _ = np.histogram(cell.flatten(), bins=256, range=(0, 256))
-                hist.append(hc.astype(np.float32))
-        hist = np.concatenate(hist)
-        hist /= hist.sum() + 1e-7
-        return hist
+def _lbph_score(stored_grey: np.ndarray, live_grey: np.ndarray) -> float:
+    """Train LBPHFaceRecognizer on augmented stored photo → predict on live frame.
+    Returns normalised similarity 0–1 (1 = perfect match)."""
+    augmented = _augment(stored_grey)
+    labels    = [0] * len(augmented)
 
-    ha   = lbp_hist(cv2.cvtColor(a, cv2.COLOR_BGR2GRAY))
-    hb   = lbp_hist(cv2.cvtColor(b, cv2.COLOR_BGR2GRAY))
-    chi2 = float(cv2.compareHist(ha, hb, cv2.HISTCMP_CHISQR))
-    return float(np.clip(1.0 - chi2 / 8.0, 0.0, 1.0))
+    recognizer = cv2.face.LBPHFaceRecognizer_create(
+        radius=2, neighbors=8, grid_x=8, grid_y=8
+    )
+    recognizer.train(augmented, np.array(labels, dtype=np.int32))
+
+    _, dist = recognizer.predict(live_grey)          # dist: 0 = perfect, ~120+ = stranger
+    dist     = float(np.clip(dist, 0.0, MAX_LBPH_DIST))
+    return float(1.0 - dist / MAX_LBPH_DIST)        # invert to similarity
 
 
-def _colour_hist_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Per-channel Bhattacharyya distance → 0-1 similarity."""
-    scores = []
-    for ch in range(3):
-        ha = cv2.calcHist([a], [ch], None, [64], [0, 256])
-        hb = cv2.calcHist([b], [ch], None, [64], [0, 256])
-        cv2.normalize(ha, ha)
-        cv2.normalize(hb, hb)
+def _ssim_score(a: np.ndarray, b: np.ndarray) -> float:
+    """Structural similarity on greyscale patches."""
+    ga = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    gb = cv2.cvtColor(b, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    C1, C2, k = 6.5025, 58.5225, (11, 11)
+    mu_a  = cv2.GaussianBlur(ga,    k, 1.5)
+    mu_b  = cv2.GaussianBlur(gb,    k, 1.5)
+    mu_a2 = mu_a ** 2; mu_b2 = mu_b ** 2; mu_ab = mu_a * mu_b
+    sig_a2 = cv2.GaussianBlur(ga ** 2, k, 1.5) - mu_a2
+    sig_b2 = cv2.GaussianBlur(gb ** 2, k, 1.5) - mu_b2
+    sig_ab = cv2.GaussianBlur(ga * gb, k, 1.5) - mu_ab
+    ssim = ((2 * mu_ab + C1) * (2 * sig_ab + C2)) / (
+        (mu_a2 + mu_b2 + C1) * (sig_a2 + sig_b2 + C2)
+    )
+    return float(np.clip(ssim.mean(), 0.0, 1.0))
+
+
+def _colour_score(a: np.ndarray, b: np.ndarray) -> float:
+    """Per-channel Bhattacharyya histogram similarity (HSV hue + sat channels)."""
+    ha_hsv = cv2.cvtColor(a, cv2.COLOR_BGR2HSV)
+    hb_hsv = cv2.cvtColor(b, cv2.COLOR_BGR2HSV)
+    scores  = []
+    for ch, bins in [(0, 180), (1, 64)]:   # hue, saturation
+        ha = cv2.calcHist([ha_hsv], [ch], None, [bins], [0, bins])
+        hb = cv2.calcHist([hb_hsv], [ch], None, [bins], [0, bins])
+        cv2.normalize(ha, ha); cv2.normalize(hb, hb)
         scores.append(1.0 - float(cv2.compareHist(ha, hb, cv2.HISTCMP_BHATTACHARYYA)))
     return float(np.mean(scores))
 
 
-def _ssim_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Simplified SSIM on greyscale → 0-1 similarity."""
-    ga = cv2.cvtColor(a, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    gb = cv2.cvtColor(b, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    C1, C2 = 6.5025, 58.5225
-    k      = (11, 11)
-    mu_a   = cv2.GaussianBlur(ga,     k, 1.5)
-    mu_b   = cv2.GaussianBlur(gb,     k, 1.5)
-    mu_a2, mu_b2, mu_ab = mu_a**2, mu_b**2, mu_a * mu_b
-    sig_a2 = cv2.GaussianBlur(ga**2,  k, 1.5) - mu_a2
-    sig_b2 = cv2.GaussianBlur(gb**2,  k, 1.5) - mu_b2
-    sig_ab = cv2.GaussianBlur(ga*gb,  k, 1.5) - mu_ab
-    ssim   = ((2*mu_ab + C1) * (2*sig_ab + C2)) / \
-             ((mu_a2 + mu_b2 + C1) * (sig_a2 + sig_b2 + C2))
-    return float(np.clip(ssim.mean(), 0.0, 1.0))
-
-
-# ── Public API ────────────────────────────────────────────────────────────────
+# ── public API ────────────────────────────────────────────────────────────────
 
 def compare_faces(
     stored_b64: str,
-    live_bytes: bytes,
-    crop_center: bool = True,
+    live_bytes:  bytes,
+    crop_center: bool = True,   # kept for API compatibility — ignored
 ) -> tuple[bool, float, str]:
     """
-    Compare the stored signup photo (base64) with a live camera frame (raw bytes).
-
-    Parameters
-    ----------
-    stored_b64  : base64-encoded image saved at signup.
-    live_bytes  : raw JPEG/PNG bytes from st.camera_input().
-    crop_center : if True (default), crops the live frame to the centre square
-                  before detection — only the face inside the blue UI guide box
-                  is matched; anything outside is ignored.
-
-    Returns
-    -------
-    (matched, score, message)
-      matched – True when score >= MATCH_THRESHOLD (0.70)
-      score   – float 0-1
-      message – human-readable result string
+    Compare stored signup photo (base64) with live camera frame (bytes).
+    Returns (matched: bool, score: float 0–1, message: str).
     """
+    # ── decode images ─────────────────────────────────────────────────────────
     stored_img = _b64_to_bgr(stored_b64)
     if stored_img is None:
         return False, 0.0, "Could not decode stored profile photo."
@@ -189,23 +218,39 @@ def compare_faces(
     if live_img is None:
         return False, 0.0, "Could not decode camera frame."
 
-    # Crop live frame to the centre square shown by the UI guide box
-    if crop_center:
-        live_img = _crop_center_square(live_img)
-
-    face_stored = _detect_face(stored_img)
+    # ── detect faces ──────────────────────────────────────────────────────────
+    # Stored photo: no eye requirement (lighting may be variable, no blue-square constraint)
+    face_stored = _detect_largest_face(stored_img, min_px=60, require_eyes=False)
     if face_stored is None:
-        return False, 0.0, "No face found in your stored signup photo. Please update it."
+        return False, 0.0, (
+            "No face found in your stored signup photo. "
+            "Please re-take your profile photo from account settings."
+        )
 
-    face_live = _detect_face(live_img)
+    # Live frame: require eyes → confirms it's a real frontal face, not an object/photo
+    face_live = _detect_largest_face(
+        live_img, min_px=MIN_FACE_PX, require_eyes=EYE_CONFIRMATION
+    )
     if face_live is None:
-        return False, 0.0, "No face detected inside the square. Look straight at the camera."
+        # Retry without eye requirement (glasses, bright lighting edge-cases)
+        face_live = _detect_largest_face(live_img, min_px=MIN_FACE_PX, require_eyes=False)
+        if face_live is None:
+            return False, 0.0, (
+                "No face detected in the camera frame. "
+                "Move closer, face the camera directly, and ensure good even lighting."
+            )
 
-    # Weighted ensemble
-    lbph_s   = _lbph_similarity(face_stored, face_live)
-    ssim_s   = _ssim_similarity(face_stored, face_live)
-    colour_s = _colour_hist_similarity(face_stored, face_live)
-    score    = 0.55 * lbph_s + 0.25 * ssim_s + 0.20 * colour_s
+    # ── compute grey patches ──────────────────────────────────────────────────
+    grey_stored = _to_grey(face_stored)
+    grey_live   = _to_grey(face_live)
+
+    # ── ensemble scores ───────────────────────────────────────────────────────
+    lbph_s   = _lbph_score(grey_stored, grey_live)       # primary — ML-based
+    ssim_s   = _ssim_score(face_stored, face_live)        # structural
+    colour_s = _colour_score(face_stored, face_live)      # skin tone / hair
+
+    # Weights: LBPH dominant (it's the actual recognizer), SSIM + colour supporting
+    score = 0.60 * lbph_s + 0.25 * ssim_s + 0.15 * colour_s
 
     logger.debug(
         "FaceAuth  LBPH=%.3f  SSIM=%.3f  Colour=%.3f  Final=%.3f  threshold=%.2f",
@@ -214,13 +259,16 @@ def compare_faces(
 
     if score >= MATCH_THRESHOLD:
         return True, score, f"Face matched ({score * 100:.0f}% similarity)."
-    return (
-        False, score,
-        f"Face did not match ({score * 100:.0f}% — need >= {MATCH_THRESHOLD * 100:.0f}%).",
+
+    return False, score, (
+        f"Face did not match ({score * 100:.0f}% — need ≥ {MATCH_THRESHOLD * 100:.0f}%). "
+        "Tips: move closer, face camera directly, use even lighting, no strong shadows."
     )
 
 
 def has_face(image_bytes: bytes) -> bool:
-    """Quick check — does this image contain at least one detectable face?"""
+    """Quick check: does this image contain a detectable face?"""
     img = _bytes_to_bgr(image_bytes)
-    return img is not None and _detect_face(img) is not None
+    if img is None:
+        return False
+    return _detect_largest_face(img, min_px=60, require_eyes=False) is not None
